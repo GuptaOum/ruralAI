@@ -1,0 +1,36 @@
+import { Router } from 'express';
+import {
+  getRegions, getUsers, createUser, updateUser, deactivateUser,
+  getAnalytics, getAuditLogs
+} from '../controllers/admin.controller.js';
+import { authenticateUser, authorizeRoles, attachRegionScope } from '../middleware/auth.middleware.js';
+import { ROLES } from '../config/roles.js';
+import { getBaselineMetrics, getDistrictOutcomes } from '../controllers/metrics.controller.js';
+import { requireFeature, FEATURES } from '../config/features.js';
+
+const router = Router();
+
+router.use(authenticateUser);
+router.use(authorizeRoles(ROLES.SUPER_ADMIN, ROLES.STATE_ADMIN, ROLES.DISTRICT_ADMIN, ROLES.AUDITOR));
+// Every handler below reads req.scope rather than trusting a region from the
+// request, so an admin cannot query outside their own state or district.
+router.use(attachRegionScope);
+
+const ADMINS_ONLY = authorizeRoles(ROLES.SUPER_ADMIN, ROLES.STATE_ADMIN, ROLES.DISTRICT_ADMIN);
+
+router.get('/regions', getRegions);
+
+router.get('/users', getUsers);
+router.post('/users', ADMINS_ONLY, createUser);
+router.patch('/users/:id', ADMINS_ONLY, updateUser);
+router.delete('/users/:id', ADMINS_ONLY, deactivateUser);
+
+router.get('/analytics', getAnalytics);
+// Phase 0 baseline outcome metrics. Aggregates only; behind a flag until the
+// function in migration 14 is applied where this runs.
+router.get('/metrics/baseline', requireFeature(FEATURES.BASELINE_METRICS), getBaselineMetrics);
+router.get('/metrics/districts', requireFeature(FEATURES.DISTRICT_OUTCOMES), getDistrictOutcomes);
+// Auditors reach this one too — it is the reason that role exists.
+router.get('/audit', getAuditLogs);
+
+export default router;

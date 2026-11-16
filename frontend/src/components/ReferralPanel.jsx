@@ -1,0 +1,388 @@
+import React, { useState, useCallback, useMemo } from 'react';
+import TrackReferralButton from './TrackReferralButton';
+import {
+  Siren, MapPin, Navigation, Phone, Loader2, AlertTriangle, ChevronDown, ChevronUp
+} from 'lucide-react';
+import api from '../services/api';
+import { Button, Card, cn } from './ui';
+import { useI18n } from '../i18n/index.jsx';
+import { serverText } from '../i18n/serverLabels.js';
+
+/**
+ * Emergency referral — where to take this patient, and how to get there.
+ *
+ * Shown for EMERGENCY and HIGH cases only. Three rules shape everything here:
+ *
+ *   Location is requested on a tap, never on load. An unprompted permission
+ *   dialog on a clinical screen is hostile, and browsers only reliably grant
+ *   geolocation inside a user gesture anyway.
+ *
+ *   The screen always produces an answer. GPS, then the clinic's district,
+ *   then a district the health worker picks — and it says which one it used,
+ *   because "12 km away" from a district centroid is a different claim from
+ *   12 km from where you are standing.
+ *
+ *   Nothing here implies a bed is free. There is no live bed feed for any
+ *   district hospital; the phone number is at least as prominent as the route
+ *   button, and the instruction to ring ahead is not collapsible. Sending a
+ *   critical patient on a long drive to a hospital that cannot admit them is
+ *   the worst thing this feature could cause.
+ */
+
+/**
+ * The English wording for this panel, and the key each string lives under.
+ *
+ * ── Why this used to be a two-language table, and why it no longer is ───────
+ *
+ * This file carried its own `COPY = { en, hi }` object — the only screen in the
+ * product with hand-written translations built in. That worked for Hindi and
+ * for nothing else: an assistant working in Odia or Tamil got this emergency
+ * panel in English while the rest of the interface was in their language. The
+ * strings now come from the shared catalogue, so all of them are covered.
+ *
+ * The Hindi that was here has been moved into locales/hi.json rather than
+ * rewritten. It was checked wording on a referral screen and there was no
+ * reason to re-translate it.
+ *
+ * The bilingual display is KEPT deliberately — see the render below. On an
+ * emergency screen, showing the English underneath is not clutter: an
+ * ambulance dispatcher or a hospital switchboard may be reading over the
+ * health worker's shoulder, and the translated line is not guaranteed to be
+ * reviewed for every locale.
+ */
+const EN = {
+  approxMinutes: '~{minutes} min',
+  title: 'Refer to hospital now',
+  confirmFirst: 'Phone before you travel',
+  confirmBody: 'Bed availability is not published live. Call and confirm the hospital can admit this patient before setting off.',
+  call: 'Call 108 — ambulance',
+  directions: 'Start directions',
+  locating: 'Finding your location…',
+  useLocation: 'Use my location for accurate distance',
+  alternatives: 'Other hospitals',
+  straightLine: 'straight-line distance',
+  byRoad: 'by road',
+  fromDistrict: 'Distance measured from your clinic district — location not available',
+  fromGps: 'Distance from your current location',
+  insecure: 'Location needs a secure (https) connection. Open the main site address rather than a preview link.',
+  denied: 'Location permission is blocked for this site. Allow it in your browser settings, or continue with your clinic district.',
+  noFix: 'No location fix yet — showing distance from your clinic district.',
+  noGeo: 'This device cannot report a location — showing distance from your clinic district.',
+  outOfBounds: 'That location reading looked wrong, so your clinic district was used instead.',
+  loadFailed: 'Could not load hospital details. Call 108 for an ambulance.',
+  callHospital: 'Call the hospital',
+  confirmCapacity: 'Call to confirm capacity before travelling',
+  capabilityUnverified: 'Services not verified — ask when you call',
+  capabilityConfirmed: 'Listed for this kind of case',
+  nabh: 'NABH accredited',
+  beds: 'licensed beds',
+  ratingNote: 'Public review score — not a measure of clinical quality',
+  whyFirst: 'Why this one'
+};
+
+/** Catalogue key for a string in EN. */
+const key = (name) => 'referral.' + name;
+
+/**
+ * One facility, with the four things that decide whether to go there.
+ *
+ * The cost line is given the most weight after the name. For a landless family
+ * the difference between a cashless PM-JAY admission and an unempanelled
+ * private hospital is not a preference — it is whether the treatment happens
+ * at all, and whether the family is still solvent afterwards.
+ *
+ * Capability is stated honestly, including when it is unknown. "Services not
+ * verified" is worse copy than silence and better medicine: it sends the
+ * health worker to the phone, which is the only place the answer exists.
+ */
+function Hospital({ h, t, num, compact }) {
+  const km = h.road_distance_km ?? h.straight_line_km;
+  const label = h.road_distance_km != null ? t.byRoad : t.straightLine;
+  const time = h.driving_time_text
+    || (h.travel_minutes != null ? t.approxMinutes.replace('{minutes}', num(h.travel_minutes)) : null);
+
+  const costTone = {
+    government: 'text-tier-low',
+    pmjay: 'text-tier-low',
+    chargeable: 'text-tier-emergency',
+    unknown: 'text-tier-moderate'
+  }[h.cost?.status] || 'text-ink-muted';
+
+  return (
+    <div className={compact ? 'py-2 min-w-0' : 'min-w-0'}>
+      <p className={compact ? 'text-sm font-semibold text-ink' : 'text-lg font-bold text-ink'}>{h.name}</p>
+
+      <p className="text-xs text-ink-muted flex items-center gap-1.5 mt-0.5 flex-wrap">
+        <MapPin className="w-3.5 h-3.5 shrink-0" />
+        {h.district}
+        {km != null && <> · {num(km)} km {label}</>}
+        {time && <> · {time}</>}
+      </p>
+
+      {h.cost?.line && (
+        <p className={`text-[11px] font-semibold mt-1 ${costTone}`}>{h.cost.line}</p>
+      )}
+
+      {!compact && (
+        <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1.5 text-[11px] text-ink-muted">
+          {h.capability === 'unverified' && (
+            <span className="text-tier-moderate font-semibold">{t.capabilityUnverified}</span>
+          )}
+          {h.capability === 'confirmed' && (
+            <span className="text-tier-low font-semibold">{t.capabilityConfirmed}</span>
+          )}
+          {h.nabh_accredited === true && <span>{t.nabh}</span>}
+          {h.licensed_beds != null && <span>{num(h.licensed_beds)} {t.beds}</span>}
+        </div>
+      )}
+
+      {!compact && h.public_rating != null && (
+        <p className="text-[11px] text-ink-subtle mt-1">
+          {num(h.public_rating)} ★ — {t.ratingNote}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export default function ReferralPanel({ visitId, riskLevel, className }) {
+  // `language` was a prop naming one of two hardcoded tables. The panel now
+  // follows the selected interface language like everything else.
+  const { t: translate, lang, formatNumber } = useI18n();
+  const tier = String(riskLevel || '').toUpperCase();
+  const applies = tier === 'EMERGENCY' || tier === 'HIGH';
+
+  /*
+   * `t(name)` is the reader's language; `EN[name]` is the English. The panel
+   * shows both when they differ — see the note on EN above.
+   */
+  const t = useMemo(() => {
+    const out = {};
+    for (const name of Object.keys(EN)) out[name] = translate(key(name), EN[name]);
+    return out;
+  }, [translate]);
+
+  const en = EN;
+  const bilingual = lang !== 'en';
+
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const [note, setNote] = useState(null);
+  const [showAlts, setShowAlts] = useState(false);
+
+  const fetchReferral = useCallback(async (coords) => {
+    setLoading(true);
+    try {
+      const res = await api.post('/referral/nearest-hospital', {
+        visit_id: visitId,
+        latitude: coords?.latitude ?? null,
+        longitude: coords?.longitude ?? null,
+        accuracy_m: coords?.accuracy ?? null
+      });
+      setData(res.data);
+      if (res.data?.origin?.rejected_out_of_bounds) {
+        setNote(t.outOfBounds);
+      }
+    } catch {
+      // Never leave the screen empty during an emergency: the national
+      // ambulance line is the one thing that is always correct.
+      setNote(t.loadFailed);
+    } finally {
+      setLoading(false);
+    }
+  }, [visitId, t]);
+
+  /**
+   * Ask for a position, then route — but never wait indefinitely, and never
+   * fail silently.
+   *
+   * Three things stop a fix arriving and they need different answers, where
+   * before they collapsed into one sentence that fitted none of them:
+   *
+   *   The page is not on a secure origin. Browsers refuse geolocation outright
+   *   over plain http, and that refusal is indistinguishable from a denied
+   *   permission. It is worth naming, because it is fixed by opening the real
+   *   site address — tapping again will never work.
+   *
+   *   Permission was denied. Also not fixed by tapping again; the block has to
+   *   be lifted in the browser's own site settings.
+   *
+   *   No fix yet. The common case, and it was treated as fatal after eight
+   *   seconds. A cold GPS fix indoors — which is where a sub-centre consultation
+   *   happens — routinely takes longer than that, so the timeout fired on
+   *   almost every first attempt and the screen quietly fell back to a district
+   *   centroid. It now waits longer, and on a timeout asks again without the
+   *   satellite requirement: Wi-Fi and cell positioning answer in a second or
+   *   two, and a few hundred metres of error still beats a centroid tens of
+   *   kilometres away.
+   */
+  const locateAndFetch = useCallback(() => {
+    if (typeof window !== 'undefined' && window.isSecureContext === false) {
+      setNote(t.insecure);
+      fetchReferral(null);
+      return;
+    }
+    if (!navigator.geolocation) {
+      setNote(t.noGeo);
+      fetchReferral(null);
+      return;
+    }
+
+    setLocating(true);
+    const done = (pos) => { setLocating(false); setNote(null); fetchReferral(pos.coords); };
+    const giveUp = (msg) => { setLocating(false); setNote(msg); fetchReferral(null); };
+
+    navigator.geolocation.getCurrentPosition(
+      done,
+      (err) => {
+        if (err.code === err.PERMISSION_DENIED) { giveUp(t.denied); return; }
+        navigator.geolocation.getCurrentPosition(
+          done,
+          (e2) => giveUp(e2.code === e2.PERMISSION_DENIED ? t.denied : t.noFix),
+          { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
+        );
+      },
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 60000 }
+    );
+  }, [fetchReferral, t]);
+
+  if (!applies) return null;
+
+  const primary = data?.primary;
+  const busy = loading || locating;
+
+  return (
+    <Card className={cn('border-2 border-tier-emergency', className)}>
+      <div className="bg-tier-emergency px-4 py-2.5">
+        <p className="text-white font-bold text-sm flex items-center gap-2">
+          <Siren className="w-4 h-4" /> {t.title}
+          {bilingual && <span className="font-normal opacity-80">· {en.title}</span>}
+        </p>
+      </div>
+
+      <div className="p-4 space-y-4">
+        {/* Ring ahead. Above the route button, and never collapsible: this is
+            the instruction that stops a patient being driven somewhere that
+            cannot admit them. */}
+        <div className="p-3 rounded-field bg-tier-emergencyBg border border-tier-emergency/30">
+          <p className="text-xs font-bold text-tier-emergency flex items-center gap-1.5">
+            <AlertTriangle className="w-4 h-4 shrink-0" /> {t.confirmFirst}
+          </p>
+          <p className="text-[11px] text-ink mt-1">{t.confirmBody}</p>
+          {bilingual && <p className="text-[11px] text-ink-muted mt-1">{en.confirmBody}</p>}
+        </div>
+
+        <a
+          href="tel:108"
+          className="flex items-center justify-center gap-2 w-full py-3.5 rounded-field bg-tier-emergency text-white font-bold text-base hover:opacity-90 transition-opacity"
+        >
+          <Phone className="w-5 h-5" /> {t.call}
+        </a>
+
+        {!data && !busy && (
+          <Button variant="secondary" className="w-full" onClick={locateAndFetch}>
+            <Navigation className="w-4 h-4" /> {t.useLocation}
+          </Button>
+        )}
+
+        {busy && (
+          <p className="text-xs text-ink-muted flex items-center gap-2 justify-center py-2">
+            <Loader2 className="w-4 h-4 animate-spin" /> {t.locating}
+          </p>
+        )}
+
+        {note && <p className="text-[11px] text-tier-moderate">{note}</p>}
+
+        {primary && (
+          <div className="space-y-3">
+            <Hospital h={primary} t={t} num={formatNumber} />
+
+            {/* Closed loop: only a referral the assistant confirms is followed up. */}
+            <TrackReferralButton visitId={visitId} hospital={primary} />
+
+            {/* How the distance was derived, said plainly — a centroid figure
+                and a real one are different claims. */}
+            <p className="text-[11px] text-ink-subtle">
+              {data.origin?.source === 'gps' ? t.fromGps : t.fromDistrict}
+            </p>
+
+            {/* The hospital's own number sits beside the route button, not under
+                it. Ringing ahead is the step that stops a critical patient
+                being driven somewhere that cannot admit them, and a button that
+                looks secondary gets treated as optional. */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {primary.phone && (
+                <a
+                  href={`tel:${String(primary.phone).replace(/\s+/g, '')}`}
+                  className="flex items-center justify-center gap-2 w-full py-3 rounded-field border-2 border-tier-emergency text-tier-emergency font-semibold text-sm hover:bg-tier-emergencyBg transition-colors"
+                >
+                  <Phone className="w-4 h-4" /> {t.callHospital}
+                </a>
+              )}
+              {primary.directions_url && (
+                <a
+                  href={primary.directions_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-2 w-full py-3 rounded-field border-2 border-gov-600 text-gov-700 dark:text-gov-500 font-semibold text-sm hover:bg-gov-50 dark:hover:bg-gov-100 transition-colors"
+                >
+                  <Navigation className="w-4 h-4" /> {t.directions}
+                </a>
+              )}
+            </div>
+            <p className="text-[11px] text-tier-emergency font-semibold text-center">{t.confirmCapacity}</p>
+
+            {data.alternatives?.length > 0 && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowAlts((v) => !v)}
+                  className="text-[11px] text-ink-muted hover:text-ink flex items-center gap-1"
+                >
+                  {showAlts ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                  {t.alternatives} ({formatNumber(data.alternatives.length)})
+                </button>
+                {showAlts && (
+                  <div className="mt-2 divide-y divide-line border-t border-line">
+                    {data.alternatives.map((h) => (
+                      <div key={h.name} className="flex items-center justify-between gap-3 py-2">
+                        <Hospital h={h} t={t} num={formatNumber} compact />
+                        {h.directions_url && (
+                          <a
+                            href={h.directions_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="shrink-0 text-[11px] text-gov-600 dark:text-gov-500 font-semibold hover:underline"
+                          >
+                            {t.directions}
+                          </a>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* The other national lines, secondary to 108 but always present. */}
+        {data?.emergency_lines && (
+          <div className="flex flex-wrap gap-2 pt-1">
+            {data.emergency_lines.filter((l) => l.number !== '108').map((l) => (
+              <a
+                key={l.number}
+                href={`tel:${l.number}`}
+                title={serverText(translate, l, 'label')}
+                className="px-2.5 py-1.5 rounded-field border border-line text-[11px] font-semibold text-ink-muted hover:bg-surface-sunken"
+              >
+                {l.number}
+              </a>
+            ))}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}

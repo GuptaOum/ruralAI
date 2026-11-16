@@ -1,0 +1,300 @@
+import React, { useRef, useState, useEffect, useCallback } from 'react';
+import { Camera, Loader2, CheckCircle2, AlertTriangle, X, ScanLine, Upload, Aperture } from 'lucide-react';
+import api from '../services/api';
+import { prepareAll, DOCUMENT } from '../services/imagePrep';
+import { useT } from '../i18n/index.jsx';
+
+/**
+ * Read a health / ABHA card to help fill the registration form.
+ *
+ * Nothing is applied automatically. The card is a suggestion and the operator
+ * is the one who decides, for two reasons that both end in the same place — a
+ * medical record attached to the wrong person:
+ *
+ *   OCR misreads. Indian cards are frequently laminated, glared, worn or
+ *   transliterated inconsistently, and a confidently wrong name looks exactly
+ *   like a correct one once it is sitting in a text box.
+ *
+ *   Typed values are evidence too. If the operator has already entered a name,
+ *   they got it from somewhere — usually the patient in front of them, who is
+ *   a better source than a photograph. Overwriting that silently would destroy
+ *   the better value with the worse one.
+ *
+ * So every field is offered as a comparison, and a field that already has a
+ * value shows what would be replaced before anything replaces it.
+ */
+
+/* [catalogue key, English fallback]. The left-hand keys are the form's own
+   field names and match what the API returns. */
+const FIELD_LABELS = {
+  full_name: ['field.name', 'Name'],
+  gender: ['field.sex', 'Sex'],
+  date_of_birth: ['field.dob', 'Date of birth']
+};
+
+const fieldLabel = (t, key) => {
+  const entry = FIELD_LABELS[key];
+  return entry ? t(entry[0], entry[1]) : key;
+};
+
+const CONFIDENCE_TONE = {
+  high: 'text-tier-low bg-tier-lowBg border-tier-low/30',
+  medium: 'text-tier-moderate bg-tier-moderateBg border-tier-moderate/30',
+  low: 'text-tier-emergency bg-tier-emergencyBg border-tier-emergency/30'
+};
+
+export default function HealthCardScanner({ form, onApply }) {
+  const t = useT();
+  const fileRef = useRef(null);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [applied, setApplied] = useState({});
+  const [cameraOn, setCameraOn] = useState(false);
+
+  /*
+   * A live camera, not just the file picker's capture hint.
+   *
+   * `capture="environment"` on an <input type=file> opens the camera on a
+   * phone and does nothing at all on a laptop, where it falls back to browsing
+   * for a file — so on the desktop the clinic actually uses, there was no way
+   * to photograph a card at all. getUserMedia works on both.
+   */
+  const stopCamera = useCallback(() => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    setCameraOn(false);
+  }, []);
+
+  useEffect(() => () => stopCamera(), [stopCamera]);
+
+  const startCamera = async () => {
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        // The rear camera where there is one; a laptop simply ignores this.
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 } }
+      });
+      streamRef.current = stream;
+      setCameraOn(true);
+      // The <video> only exists once cameraOn has rendered it.
+      requestAnimationFrame(() => {
+        if (videoRef.current) videoRef.current.srcObject = stream;
+      });
+    } catch (err) {
+      setError(
+        err.name === 'NotAllowedError'
+          ? t('scan.cameraDenied', 'Camera permission was refused. Allow it in the browser, or upload a photo instead.')
+          : t('scan.cameraMissing', 'No camera is available on this device. Upload a photo instead.')
+      );
+    }
+  };
+
+  /** Grab the current frame at full sensor resolution and read it. */
+  const captureFrame = async () => {
+    const video = videoRef.current;
+    if (!video || !video.videoWidth) return;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+
+    const blob = await new Promise((resolve) =>
+      // JPEG at 0.92: a card is flat printed text, and PNG would treble the
+      // upload size for no legibility gain over a link that may be very slow.
+      canvas.toBlob(resolve, 'image/jpeg', 0.92)
+    );
+    stopCamera();
+    if (blob) await scan([new File([blob], 'health-card.jpg', { type: 'image/jpeg' })]);
+  };
+
+  const scan = async (files) => {
+    if (!files?.length) return;
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    setApplied({});
+
+    // Same treatment as any other document: shrunk on the device before it
+    // travels. A card photographed at full camera resolution is several
+    // megabytes of uplink for text that reads fine at a fraction of it.
+    const body = new FormData();
+    for (const f of await prepareAll(files, DOCUMENT)) body.append('files', f);
+
+    try {
+      const res = await api.post('/documents/health-card', body, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+      setResult(res.data);
+    } catch (err) {
+      setError(err.response?.data?.error || t('scan.unreadable', 'The card could not be read. Enter the details by hand.'));
+    } finally {
+      setBusy(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+
+  const apply = (key, value) => {
+    onApply(key, value);
+    setApplied((a) => ({ ...a, [key]: true }));
+  };
+
+  const proposals = Object.entries(result?.fields || {})
+    .filter(([key]) => key in FIELD_LABELS);
+
+  return (
+    <div className="p-4 rounded-field border border-dashed border-line-strong bg-surface-sunken space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-xs font-bold text-ink flex items-center gap-1.5">
+            <ScanLine className="w-4 h-4 text-gov-600" /> {t('scan.title', 'Scan a health card (optional)')}
+          </h3>
+          <p className="text-[11px] text-ink-muted mt-0.5">
+            {t('scan.subtitle', 'Photograph an ABHA or health card to read the name, sex and date of birth. Nothing is filled in until you accept it.')}
+          </p>
+        </div>
+        <div className="shrink-0 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={cameraOn ? captureFrame : startCamera}
+            disabled={busy}
+            className="px-3 py-2 rounded-field bg-gov-600 hover:bg-gov-700 disabled:opacity-50 text-white text-xs font-semibold flex items-center gap-1.5"
+          >
+            {busy
+              ? <><Loader2 className="w-4 h-4 animate-spin" /> {t('scan.reading', 'Reading…')}</>
+              : cameraOn
+                ? <><Aperture className="w-4 h-4" /> {t('scan.capture', 'Capture')}</>
+                : <><Camera className="w-4 h-4" /> {t('scan.useCamera', 'Use camera')}</>}
+          </button>
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={busy}
+            title={t('scan.uploadHint', 'Upload a photo or PDF instead')}
+            className="px-3 py-2 rounded-field border border-line text-ink-muted hover:bg-surface-raised disabled:opacity-50 text-xs font-semibold flex items-center gap-1.5"
+          >
+            <Upload className="w-4 h-4" /> {t('scan.upload', 'Upload')}
+          </button>
+        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*,application/pdf"
+          multiple
+          hidden
+          onChange={(e) => scan(Array.from(e.target.files || []))}
+        />
+      </div>
+
+      {cameraOn && (
+        <div className="space-y-2">
+          <div className="relative rounded-field overflow-hidden bg-black border border-line">
+            <video ref={videoRef} autoPlay playsInline muted className="w-full max-h-64 object-contain" />
+            {/* A frame guide: a card photographed at an angle reads far worse
+                than one held square to the lens. */}
+            <div className="absolute inset-6 border-2 border-dashed border-white/40 rounded pointer-events-none" />
+          </div>
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] text-ink-muted">
+              {t('scan.frameHint', 'Hold the card inside the frame, then press Capture.')}
+            </p>
+            <button type="button" onClick={stopCamera} className="text-[11px] text-ink-subtle hover:text-ink">
+              {t('common.cancel', 'Cancel')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div role="alert" className="p-2.5 rounded-field bg-tier-emergencyBg border border-tier-emergency/30 text-[11px] text-tier-emergency flex items-start gap-1.5">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {result && (
+        <div className="space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className={`text-[10px] font-bold px-2 py-0.5 rounded border uppercase ${CONFIDENCE_TONE[result.confidence] || CONFIDENCE_TONE.low}`}>
+              {t('scan.confidence', '{level} confidence', {
+                level: t('scan.confidence.' + result.confidence, result.confidence)
+              })}
+            </span>
+            <button
+              type="button"
+              onClick={() => setResult(null)}
+              className="text-[11px] text-ink-subtle hover:text-ink flex items-center gap-1"
+            >
+              <X className="w-3 h-3" /> {t('common.dismiss', 'Dismiss')}
+            </button>
+          </div>
+
+          {result.confidence === 'low' && (
+            <p className="text-[11px] text-tier-moderate">
+              {t('scan.lowConfidence', 'The image was hard to read. Check every value against the card before accepting it.')}
+            </p>
+          )}
+
+          {proposals.length === 0 ? (
+            <p className="text-[11px] text-ink-muted">
+              {t('scan.nothingUsable', 'Nothing usable was read from this card. Enter the details by hand.')}
+            </p>
+          ) : (
+            <ul className="space-y-1.5">
+              {proposals.map(([key, value]) => {
+                const current = form[key];
+                const same = String(current || '') === String(value);
+                return (
+                  <li key={key} className="flex items-center gap-2 text-[11px] bg-surface-raised border border-line rounded-field px-2.5 py-2">
+                    <span className="text-ink-muted w-24 shrink-0">{fieldLabel(t, key)}</span>
+                    <span className="font-semibold text-ink truncate flex-1">{value}</span>
+
+                    {same ? (
+                      <span className="text-tier-low flex items-center gap-1 shrink-0">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {t('scan.matches', 'matches')}
+                      </span>
+                    ) : applied[key] ? (
+                      <span className="text-tier-low flex items-center gap-1 shrink-0">
+                        <CheckCircle2 className="w-3.5 h-3.5" /> {t('scan.applied', 'applied')}
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => apply(key, value)}
+                        className="shrink-0 px-2 py-1 rounded bg-gov-600 hover:bg-gov-700 text-white font-semibold"
+                      >
+                        {/* Naming what is being lost, rather than a bare "Use". */}
+                        {current
+                          ? t('scan.replace', 'Replace “{value}”', { value: String(current).slice(0, 18) })
+                          : t('scan.use', 'Use')}
+                      </button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {result.rejected?.length > 0 && (
+            <p className="text-[11px] text-ink-subtle">
+              {t('scan.notRead', 'Not read from this card: {fields}. Enter by hand.', {
+                fields: result.rejected.map((k) => fieldLabel(t, k)).join(', ')
+              })}
+            </p>
+          )}
+
+          {result.fields?.year_of_birth && !result.fields?.date_of_birth && (
+            <p className="text-[11px] text-ink-muted">
+              {t('scan.yearOnly', 'The card shows only a year of birth ({year}). Enter the full date, or the patient’s stated age.', {
+                year: result.fields.year_of_birth
+              })}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

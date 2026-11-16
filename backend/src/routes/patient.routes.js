@@ -1,0 +1,45 @@
+import { Router } from 'express';
+import {
+  createPatient, getPatients, lookupByAadhaar, getPatientDetail, updatePatient,
+  registerUrgentPatient
+} from '../controllers/patient.controller.js';
+import { getConsents, grantConsent, withdrawConsent } from '../controllers/consent.controller.js';
+import { authenticateUser, authorizeRoles } from '../middleware/auth.middleware.js';
+import { requireFeature, FEATURES } from '../config/features.js';
+import { idempotent } from '../middleware/idempotency.middleware.js';
+import { denyAdminClinicalAccess } from '../middleware/clinicalAccess.middleware.js';
+import { patientSearchRateLimiter } from '../middleware/rateLimit.middleware.js';
+import { ROLES } from '../config/roles.js';
+
+const router = Router();
+
+router.use(authenticateUser);
+// Admins and auditors have no clinical access. Mounted on the router so a
+// route added below without its own role list still fails closed.
+router.use(denyAdminClinicalAccess);
+
+const CLINICAL = authorizeRoles(ROLES.CLINIC_ASSISTANT, ROLES.DOCTOR);
+
+// Reads are POSTs wherever the Aadhaar number is the key: it is the patient
+// identifier now, and a URL path would put it into access logs, proxy logs and
+// browser history. The rate limiter matters more for the same reason — these
+// are the routes an attacker would walk to probe which Aadhaars are registered.
+router.post('/lookup', patientSearchRateLimiter, CLINICAL, lookupByAadhaar);
+router.post('/detail', patientSearchRateLimiter, CLINICAL, getPatientDetail);
+
+// Consent, keyed by Aadhaar in the body like every other patient read.
+const CONSENT = [requireFeature(FEATURES.PATIENT_CONSENT), patientSearchRateLimiter, CLINICAL];
+router.post('/consents', ...CONSENT, getConsents);
+router.post('/consents/grant', ...CONSENT, grantConsent);
+router.post('/consents/withdraw', ...CONSENT, withdrawConsent);
+
+router.get('/', patientSearchRateLimiter, CLINICAL, getPatients);
+router.post('/', authorizeRoles(ROLES.CLINIC_ASSISTANT), idempotent('patients.create'), createPatient);
+
+// Emergency bypass: a provisional record for a patient who needs care before
+// their documents exist. Deliberately a separate endpoint — createPatient's
+// validation requires the identity data this path is defined by not having.
+router.post('/urgent', authorizeRoles(ROLES.CLINIC_ASSISTANT), registerUrgentPatient);
+router.patch('/', authorizeRoles(ROLES.CLINIC_ASSISTANT), updatePatient);
+
+export default router;
